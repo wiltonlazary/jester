@@ -1,6 +1,6 @@
 # Copyright (C) 2015 Dominik Picheta
 # MIT License - Look at license.txt for details.
-import net, strtabs, re, tables, parseutils, os, strutils, uri,
+import net, strtabs, re, tables, os, strutils, uri,
        times, mimetypes, asyncnet, asyncdispatch, macros, md5,
        logging, httpcore, asyncfile, macrocache, json, options,
        strformat
@@ -73,7 +73,7 @@ type
     of RouteCode:
       data: ResponseData
 
-const jesterVer = "0.4.3"
+const jesterVer = "0.5.0"
 
 proc toStr(headers: Option[RawHeaders]): string =
   return $newHttpHeaders(headers.get(@({:})))
@@ -99,22 +99,24 @@ proc unsafeSend(request: Request, content: string) =
 
 proc send(
   request: Request, code: HttpCode, headers: Option[RawHeaders], body: string
-) =
+): Future[void] =
   when useHttpBeast:
     let h =
       if headers.isNone: ""
       else: headers.get().createHeaders
     request.getNativeReq.send(code, body, h)
+    var fut = newFuture[void]()
+    complete(fut)
+    return fut
   else:
-    # TODO: This may cause issues if we send too fast.
-    asyncCheck request.getNativeReq.respond(
+    return request.getNativeReq.respond(
       code, body, newHttpHeaders(headers.get(@({:})))
     )
 
 proc statusContent(request: Request, status: HttpCode, content: string,
-                   headers: Option[RawHeaders]) =
+                   headers: Option[RawHeaders]): Future[void] =
   try:
-    send(request, status, headers, content)
+    result = send(request, status, headers, content)
     when not defined(release):
       logging.debug("  $1 $2" % [$status, toStr(headers)])
   except:
@@ -188,18 +190,18 @@ proc sendStaticIfExists(
         # If the user has a cached version of this file and it matches our
         # version, let them use it
         if req.headers.hasKey("If-None-Match") and req.headers["If-None-Match"] == hashed:
-          req.statusContent(Http304, "", none[RawHeaders]())
+          await req.statusContent(Http304, "", none[RawHeaders]())
         else:
-          req.statusContent(Http200, file, some(@({
-                              "Content-Type": mimetype,
-                              "ETag": hashed
-                            })))
+          await req.statusContent(Http200, file, some(@({
+            "Content-Type": mimetype,
+            "ETag": hashed
+          })))
       else:
         let headers = @({
           "Content-Type": mimetype,
           "Content-Length": $fileSize
         })
-        req.statusContent(Http200, "", some(headers))
+        await req.statusContent(Http200, "", some(headers))
 
         var fileStream = newFutureStream[string]("sendStaticIfExists")
         var file = openAsync(p, fmRead)
@@ -227,7 +229,7 @@ proc close*(request: Request) =
   ## Routes using this procedure must enable raw mode.
   let nativeReq = request.getNativeReq()
   when useHttpBeast:
-    nativeReq.forget()  
+    nativeReq.forget()
   nativeReq.client.close()
 
 proc defaultErrorFilter(error: RouteError): ResponseData =
@@ -305,8 +307,9 @@ proc handleFileRequest(
 ): Future[ResponseData] {.async.} =
   # Find static file.
   # TODO: Caching.
-  let path = normalizedPath(
-    jes.settings.staticDir / cgi.decodeUrl(req.pathInfo)
+  # no need to normalize staticDir since it is normalized in `newSettings`
+  let path = jes.settings.staticDir / normalizedPath(
+    cgi.decodeUrl(req.pathInfo)
   )
 
   # Verify that this isn't outside our static dir.
@@ -363,7 +366,7 @@ proc handleRequestSlow(
         not dispatchedError and respData.content.len == 0:
       respData = await dispatchError(jes, req, initRouteError(respData))
 
-    statusContent(
+    await statusContent(
       req,
       respData.code,
       respData.content,
@@ -384,7 +387,7 @@ proc handleRequest(jes: Jester, httpReq: NativeRequest): Future[void] =
     if likely(jes.matchers.len == 1 and not jes.matchers[0].async):
       let respData = jes.matchers[0].syncProc(req)
       if likely(respData.matched):
-        statusContent(
+        return statusContent(
           req,
           respData.code,
           respData.content,
@@ -398,9 +401,8 @@ proc handleRequest(jes: Jester, httpReq: NativeRequest): Future[void] =
     let exc = getCurrentException()
     let respDataFut = dispatchError(jes, req, initRouteError(exc))
     return handleRequestSlow(jes, req, respDataFut, true)
-  let future = newFuture[void]()
-  complete(future)
-  return future
+
+  assert(not result.isNil, "Expected handleRequest to return a valid future.")
 
 proc newSettings*(
   port = Port(5000), staticDir = getCurrentDir() / "public",
@@ -408,7 +410,7 @@ proc newSettings*(
   futureErrorHandler: proc (fut: Future[void]) {.closure, gcsafe.} = nil
 ): Settings =
   result = Settings(
-    staticDir: staticDir,
+    staticDir: normalizedPath(staticDir),
     appName: appName,
     port: port,
     bindAddr: bindAddr,
@@ -526,7 +528,7 @@ template setHeader(headers: var Option[RawHeaders], key, value: string): typed =
       headers = some(h & @({key: value}))
 
 template resp*(code: HttpCode,
-               headers: openarray[tuple[key, value: string]],
+               headers: openarray[tuple[key, val: string]],
                content: string): typed =
   ## Sets ``(code, headers, content)`` as the response.
   bind TCActionSend
@@ -574,8 +576,11 @@ template resp*(code: HttpCode): typed =
   result.matched = true
   break route
 
-template redirect*(url: string): typed =
+template redirect*(url: string, halt = true): typed =
   ## Redirects to ``url``. Returns from this request handler immediately.
+  ##
+  ## If ``halt`` is true, skips executing future handlers, too.
+  ##
   ## Any set response headers are preserved for this request.
   bind TCActionSend, newHttpHeaders
   result[0] = TCActionSend
@@ -583,7 +588,10 @@ template redirect*(url: string): typed =
   setHeader(result[2], "Location", url)
   result[3] = ""
   result.matched = true
-  break route
+  if halt:
+    break allRoutes
+  else:
+    break route
 
 template pass*(): typed =
   ## Skips this request handler.
@@ -711,11 +719,11 @@ template uri*(address = "", absolute = true, addScriptName = true): untyped =
 
 proc daysForward*(days: int): DateTime =
   ## Returns a DateTime object referring to the current time plus ``days``.
-  return getTime().utc + initInterval(days = days)
+  return getTime().utc + initTimeInterval(days = days)
 
 template setCookie*(name, value: string, expires="",
                     sameSite: SameSite=Lax, secure = false,
-                    httpOnly = false, domain = "", path = ""): typed =
+                    httpOnly = false, domain = "", path = "") =
   ## Creates a cookie which stores ``value`` under ``name``.
   ##
   ## The SameSite argument determines the level of CSRF protection that
@@ -732,7 +740,7 @@ template setCookie*(name, value: string, expires="",
 
 template setCookie*(name, value: string, expires: DateTime,
                     sameSite: SameSite=Lax, secure = false,
-                    httpOnly = false, domain = "", path = ""): typed =
+                    httpOnly = false, domain = "", path = "") =
   ## Creates a cookie which stores ``value`` under ``name``.
   setCookie(name, value,
             format(expires.utc, "ddd',' dd MMM yyyy HH:mm:ss 'GMT'"),
@@ -798,14 +806,14 @@ proc ctParsePattern(pattern, pathPrefix: string): NimNode {.compiletime.} =
       newStrLitNode(node.text),
       newIdentNode(if node.optional: "true" else: "false"))
 
-template setDefaultResp*(): typed =
+template setDefaultResp*() =
   # TODO: bindSym this in the 'routes' macro and put it in each route
   bind TCActionNothing, newHttpHeaders
   result.action = TCActionNothing
   result.code = Http200
   result.content = ""
 
-template declareSettings(): typed {.dirty.} =
+template declareSettings() {.dirty.} =
   when not declaredInScope(settings):
     var settings = newSettings()
 
@@ -1347,7 +1355,7 @@ proc routesEx(name: string, body: NimNode): NimNode =
   # echo toStrLit(result)
   # echo treeRepr(result)
 
-macro routes*(body: untyped): typed =
+macro routes*(body: untyped) =
   result = routesEx("match", body)
   let jesIdent = genSym(nskVar, "jes")
   let matchIdent = newIdentNode("match")
@@ -1363,13 +1371,13 @@ macro routes*(body: untyped): typed =
       serve(`jesIdent`)
   )
 
-macro router*(name: untyped, body: untyped): typed =
+macro router*(name: untyped, body: untyped) =
   if name.kind != nnkIdent:
     error("Need an ident.", name)
 
-  routesEx($name.ident, body)
+  routesEx(strVal(name), body)
 
-macro settings*(body: untyped): typed =
+macro settings*(body: untyped) =
   #echo(treeRepr(body))
   expectKind(body, nnkStmtList)
 
